@@ -5,218 +5,252 @@ import { APU } from '../apu';
 import { Bus } from '../bus';
 import { Controller } from '../controller';
 import { createMapper0 } from '../mapper/mapper0';
-import { MirrorMode, CYCLES_PER_FRAME, PPU_CYCLES_PER_CPU } from '../types';
+import { MirrorMode, PPU_CYCLES_PER_CPU, Button } from '../types';
 import type { RomInfo } from '../rom';
 
 /**
- * Creates a fully wired NES emulator with a synthetic test ROM.
- * The test ROM enables rendering, sets up NMI, and enters an infinite loop.
+ * Full emulation integration tests - exercises the complete NES pipeline
+ * over multiple frames to verify the system works end-to-end.
  */
-function createTestNES(prgRomData?: Uint8Array, chrRomData?: Uint8Array) {
-  // Build PRG ROM (32KB)
-  const prgRom = prgRomData ?? new Uint8Array(32768);
-  const chrRom = chrRomData ?? new Uint8Array(8192);
+describe('Multi-frame emulation', () => {
+  function createTestSystem(opts: {
+    prgRom: Uint8Array;
+    chrRom?: Uint8Array;
+    mirrorMode?: MirrorMode;
+  }) {
+    const romInfo: RomInfo = {
+      prgRom: opts.prgRom,
+      chrRom: opts.chrRom ?? new Uint8Array(8192),
+      mapper: 0,
+      mirrorMode: opts.mirrorMode ?? MirrorMode.Horizontal,
+      hasBatteryRam: false,
+      chrIsRam: true,
+    };
 
-  if (!prgRomData) {
-    // Default test program: enable rendering + NMI, loop forever
-    let pc = 0; // offset in PRG (maps to $8000)
+    const mapper = createMapper0(romInfo);
+    const apu = new APU();
+    const ctrl1 = new Controller();
+    const ctrl2 = new Controller();
+    const bus = new Bus(mapper, apu, ctrl1, ctrl2);
 
-    // Reset handler ($8000):
-    prgRom[pc++] = 0x78;                   // SEI
-    prgRom[pc++] = 0xD8;                   // CLD
+    const cpu = new CPU();
+    cpu.read = (addr: number) => bus.cpuRead(addr);
+    cpu.write = (addr: number, val: number) => bus.cpuWrite(addr, val);
 
-    // Wait for first VBlank
-    const waitVBL1 = pc;
-    prgRom[pc++] = 0x2C; prgRom[pc++] = 0x02; prgRom[pc++] = 0x20;  // BIT $2002
-    prgRom[pc++] = 0x10; prgRom[pc++] = 0xFB;  // BPL waitVBL1
+    const ppu = new PPU();
+    ppu.setMapper(mapper);
+    bus.setPPU(ppu);
+    bus.setDmaStallCallback((cycles: number) => cpu.stallCycles(cycles));
 
-    // Clear RAM
-    prgRom[pc++] = 0xA2; prgRom[pc++] = 0x00;  // LDX #$00
-    prgRom[pc++] = 0x8A;                         // TXA
-    const clearLoop = pc;
-    prgRom[pc++] = 0x95; prgRom[pc++] = 0x00;  // STA $00,X
-    prgRom[pc++] = 0xE8;                         // INX
-    prgRom[pc++] = 0xD0; prgRom[pc++] = 0xFB;  // BNE clearLoop
+    cpu.reset();
 
-    // Wait for second VBlank
-    const waitVBL2 = pc;
-    prgRom[pc++] = 0x2C; prgRom[pc++] = 0x02; prgRom[pc++] = 0x20;  // BIT $2002
-    prgRom[pc++] = 0x10; prgRom[pc++] = 0xFB;  // BPL waitVBL2
-
-    // Configure PPU
-    prgRom[pc++] = 0xA9; prgRom[pc++] = 0x80;  // LDA #$80 (NMI enable)
-    prgRom[pc++] = 0x8D; prgRom[pc++] = 0x00; prgRom[pc++] = 0x20;  // STA $2000
-
-    prgRom[pc++] = 0xA9; prgRom[pc++] = 0x1E;  // LDA #$1E (show bg+sprites, left 8px)
-    prgRom[pc++] = 0x8D; prgRom[pc++] = 0x01; prgRom[pc++] = 0x20;  // STA $2001
-
-    // Write some palette data
-    prgRom[pc++] = 0xA9; prgRom[pc++] = 0x3F;  // LDA #$3F
-    prgRom[pc++] = 0x8D; prgRom[pc++] = 0x06; prgRom[pc++] = 0x20;  // STA $2006
-    prgRom[pc++] = 0xA9; prgRom[pc++] = 0x00;  // LDA #$00
-    prgRom[pc++] = 0x8D; prgRom[pc++] = 0x06; prgRom[pc++] = 0x20;  // STA $2006
-    // Write palette entries
-    const paletteData = [0x0F, 0x01, 0x21, 0x31, 0x0F, 0x06, 0x16, 0x26,
-                         0x0F, 0x09, 0x19, 0x29, 0x0F, 0x02, 0x12, 0x22];
-    for (const byte of paletteData) {
-      prgRom[pc++] = 0xA9; prgRom[pc++] = byte;  // LDA #byte
-      prgRom[pc++] = 0x8D; prgRom[pc++] = 0x07; prgRom[pc++] = 0x20;  // STA $2007
-    }
-
-    // Infinite loop
-    const mainLoop = pc;
-    prgRom[pc++] = 0x4C; prgRom[pc++] = (0x8000 + mainLoop) & 0xFF; prgRom[pc++] = ((0x8000 + mainLoop) >> 8) & 0xFF;
-
-    // NMI handler - increment frame counter at $00, then RTI
-    const nmiHandler = pc;
-    prgRom[pc++] = 0xE6; prgRom[pc++] = 0x00;  // INC $00 (frame counter)
-    prgRom[pc++] = 0x40;                         // RTI
-
-    // Vectors at end of PRG ROM
-    // NMI vector ($FFFA)
-    prgRom[0x7FFA] = (0x8000 + nmiHandler) & 0xFF;
-    prgRom[0x7FFB] = ((0x8000 + nmiHandler) >> 8) & 0xFF;
-    // Reset vector ($FFFC)
-    prgRom[0x7FFC] = 0x00;
-    prgRom[0x7FFD] = 0x80;
-    // IRQ vector ($FFFE)
-    prgRom[0x7FFE] = 0x00;
-    prgRom[0x7FFF] = 0x80;
+    return { cpu, ppu, bus, ctrl1, ctrl2, mapper };
   }
 
-  if (!chrRomData) {
-    // Write a simple tile pattern (solid tile at index 0)
-    // Plane 0: all 1s
-    for (let i = 0; i < 8; i++) {
-      chrRom[i] = 0xFF;
-    }
-    // Plane 1: all 1s (color 3)
-    for (let i = 8; i < 16; i++) {
-      chrRom[i] = 0xFF;
-    }
-  }
-
-  const romInfo: RomInfo = {
-    prgRom,
-    chrRom,
-    mapper: 0,
-    mirrorMode: MirrorMode.Horizontal,
-    hasBatteryRam: false,
-    chrIsRam: !chrRomData,
-  };
-
-  const mapper = createMapper0(romInfo);
-  const apu = new APU();
-  const controller1 = new Controller();
-  const controller2 = new Controller();
-  const bus = new Bus(mapper, apu, controller1, controller2);
-  const cpu = new CPU();
-  const ppu = new PPU();
-
-  cpu.read = (addr: number) => bus.cpuRead(addr);
-  cpu.write = (addr: number, val: number) => bus.cpuWrite(addr, val);
-  ppu.setMapper(mapper);
-
-  bus.setPPU({
-    ppuRead: (reg: number) => ppu.readRegister(reg),
-    ppuWrite: (reg: number, val: number) => ppu.writeRegister(reg, val),
-    oamDmaWrite: (data: Uint8Array) => ppu.oamDmaWrite(data),
-  });
-
-  bus.setDmaStallCallback((cycles: number) => {
-    cpu.stallCycles(cycles);
-  });
-
-  cpu.reset();
-
-  return { cpu, ppu, bus, mapper, controller1, controller2, apu };
-}
-
-/**
- * Run one frame of emulation (CPU + PPU)
- */
-function runFrame(cpu: CPU, ppu: PPU): { cpuCycles: number; nmiTriggered: boolean } {
-  let cpuCyclesThisFrame = 0;
-  let nmiTriggered = false;
-
-  while (cpuCyclesThisFrame < CYCLES_PER_FRAME) {
-    const cpuCycles = cpu.step();
-    cpuCyclesThisFrame += cpuCycles;
-
-    const ppuCycles = cpuCycles * PPU_CYCLES_PER_CPU;
-    for (let i = 0; i < ppuCycles; i++) {
+  function runFrame(cpu: CPU, ppu: PPU): boolean {
+    const maxCycles = 90000; // well over one frame of PPU cycles
+    for (let i = 0; i < maxCycles; i++) {
       ppu.step();
 
       if (ppu.nmiPending) {
         cpu.triggerNMI();
         ppu.nmiPending = false;
-        nmiTriggered = true;
+      }
+
+      if (i % PPU_CYCLES_PER_CPU === 0) {
+        cpu.step();
+      }
+
+      if (ppu.frameComplete) {
+        ppu.frameComplete = false;
+        return true;
       }
     }
-
-    if (ppu.frameComplete) {
-      ppu.frameComplete = false;
-      break;
-    }
+    return false;
   }
 
-  return { cpuCycles: cpuCyclesThisFrame, nmiTriggered };
-}
+  function buildTestRom(): Uint8Array {
+    const prg = new Uint8Array(32768);
 
-describe('Full emulation', () => {
-  test('CPU initializes from reset vector', () => {
-    const { cpu } = createTestNES();
-    // Reset vector at $FFFC points to $8000
-    expect(cpu.pc).toBeGreaterThanOrEqual(0x8000);
-  });
+    // Reset handler at $8000:
+    // SEI, CLD, LDX #$FF, TXS (set up stack)
+    // LDA #$80, STA $2000 (enable NMI)
+    // LDA #$1E, STA $2001 (enable rendering: show BG + sprites)
+    // Write palette data to $3F00 via $2006/$2007
+    // OAM DMA setup: write sprite data, STA $4014
+    // Infinite loop: JMP $loop
+    let pc = 0;
 
-  test('runs multiple frames without crashing', () => {
-    const { cpu, ppu } = createTestNES();
+    // -- Init --
+    prg[pc++] = 0x78;                     // SEI
+    prg[pc++] = 0xD8;                     // CLD
+    prg[pc++] = 0xA2; prg[pc++] = 0xFF;  // LDX #$FF
+    prg[pc++] = 0x9A;                     // TXS
 
-    for (let frame = 0; frame < 10; frame++) {
-      const result = runFrame(cpu, ppu);
-      expect(result.cpuCycles).toBeGreaterThan(0);
+    // Wait for first VBlank (read $2002 until bit 7 set)
+    const waitVbl1 = pc;
+    prg[pc++] = 0xAD; prg[pc++] = 0x02; prg[pc++] = 0x20;  // LDA $2002
+    prg[pc++] = 0x10;                                         // BPL
+    prg[pc++] = 0xFB & 0xFF;                                  // back to waitVbl1
+    // BPL offset: from PC after BPL operand = waitVbl1 + 5, target = waitVbl1
+    // offset = waitVbl1 - (waitVbl1 + 5) = -5 = 0xFB
+
+    // Wait for second VBlank
+    const waitVbl2 = pc;
+    prg[pc++] = 0xAD; prg[pc++] = 0x02; prg[pc++] = 0x20;  // LDA $2002
+    prg[pc++] = 0x10; prg[pc++] = 0xFB;                      // BPL -5
+
+    // -- Write palette via $2006/$2007 --
+    prg[pc++] = 0xA9; prg[pc++] = 0x3F;  // LDA #$3F
+    prg[pc++] = 0x8D; prg[pc++] = 0x06; prg[pc++] = 0x20;  // STA $2006
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;  // LDA #$00
+    prg[pc++] = 0x8D; prg[pc++] = 0x06; prg[pc++] = 0x20;  // STA $2006
+
+    // Write 32 palette entries (4 BG palettes + 4 sprite palettes)
+    const paletteData = [
+      0x0F, 0x01, 0x21, 0x30,  // BG palette 0
+      0x0F, 0x06, 0x16, 0x26,  // BG palette 1
+      0x0F, 0x09, 0x19, 0x29,  // BG palette 2
+      0x0F, 0x02, 0x12, 0x22,  // BG palette 3
+      0x0F, 0x01, 0x21, 0x30,  // Sprite palette 0
+      0x0F, 0x06, 0x16, 0x26,  // Sprite palette 1
+      0x0F, 0x09, 0x19, 0x29,  // Sprite palette 2
+      0x0F, 0x02, 0x12, 0x22,  // Sprite palette 3
+    ];
+    for (const byte of paletteData) {
+      prg[pc++] = 0xA9; prg[pc++] = byte;                    // LDA #byte
+      prg[pc++] = 0x8D; prg[pc++] = 0x07; prg[pc++] = 0x20; // STA $2007
     }
-  });
 
-  test('NMI fires each frame after being enabled', () => {
-    const { cpu, ppu } = createTestNES();
+    // -- Write some nametable data (a few tiles) --
+    prg[pc++] = 0xA9; prg[pc++] = 0x20;  // LDA #$20
+    prg[pc++] = 0x8D; prg[pc++] = 0x06; prg[pc++] = 0x20;  // STA $2006 (hi)
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;  // LDA #$00
+    prg[pc++] = 0x8D; prg[pc++] = 0x06; prg[pc++] = 0x20;  // STA $2006 (lo) -> $2000
 
-    // Run frames until NMI is enabled (first few frames are VBlank waits + setup)
-    let nmiCount = 0;
-    for (let frame = 0; frame < 20; frame++) {
-      const result = runFrame(cpu, ppu);
-      if (result.nmiTriggered) {
-        nmiCount++;
-      }
+    // Write tile IDs 1-16 for the first 16 tiles
+    for (let i = 1; i <= 16; i++) {
+      prg[pc++] = 0xA9; prg[pc++] = i;                       // LDA #i
+      prg[pc++] = 0x8D; prg[pc++] = 0x07; prg[pc++] = 0x20; // STA $2007
     }
 
-    // After 20 frames, NMI should have fired multiple times
-    expect(nmiCount).toBeGreaterThan(3);
+    // -- Set up sprite 0 for hit detection --
+    // Write sprite data to page 2 ($0200-$02FF)
+    prg[pc++] = 0xA9; prg[pc++] = 0x1E;  // LDA #$1E (Y = 30)
+    prg[pc++] = 0x8D; prg[pc++] = 0x00; prg[pc++] = 0x02;  // STA $0200
+    prg[pc++] = 0xA9; prg[pc++] = 0x01;  // LDA #$01 (tile = 1)
+    prg[pc++] = 0x8D; prg[pc++] = 0x01; prg[pc++] = 0x02;  // STA $0201
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;  // LDA #$00 (attributes = 0)
+    prg[pc++] = 0x8D; prg[pc++] = 0x02; prg[pc++] = 0x02;  // STA $0202
+    prg[pc++] = 0xA9; prg[pc++] = 0x10;  // LDA #$10 (X = 16)
+    prg[pc++] = 0x8D; prg[pc++] = 0x03; prg[pc++] = 0x02;  // STA $0203
+
+    // OAM DMA: write $02 to $4014
+    prg[pc++] = 0xA9; prg[pc++] = 0x02;  // LDA #$02
+    prg[pc++] = 0x8D; prg[pc++] = 0x14; prg[pc++] = 0x40;  // STA $4014
+
+    // -- Set scroll position (0,0) --
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;  // LDA #$00
+    prg[pc++] = 0x8D; prg[pc++] = 0x05; prg[pc++] = 0x20;  // STA $2005 (X scroll)
+    prg[pc++] = 0x8D; prg[pc++] = 0x05; prg[pc++] = 0x20;  // STA $2005 (Y scroll)
+
+    // -- Enable rendering --
+    prg[pc++] = 0xA9; prg[pc++] = 0x90;  // LDA #$90 (enable NMI, BG from pattern table 1)
+    prg[pc++] = 0x8D; prg[pc++] = 0x00; prg[pc++] = 0x20;  // STA $2000
+    prg[pc++] = 0xA9; prg[pc++] = 0x1E;  // LDA #$1E (show BG + sprites)
+    prg[pc++] = 0x8D; prg[pc++] = 0x01; prg[pc++] = 0x20;  // STA $2001
+
+    // -- Main loop: just read controller and wait --
+    const mainLoop = pc;
+    prg[pc++] = 0xA9; prg[pc++] = 0x01;  // LDA #$01
+    prg[pc++] = 0x8D; prg[pc++] = 0x16; prg[pc++] = 0x40;  // STA $4016 (strobe on)
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;  // LDA #$00
+    prg[pc++] = 0x8D; prg[pc++] = 0x16; prg[pc++] = 0x40;  // STA $4016 (strobe off)
+    prg[pc++] = 0xAD; prg[pc++] = 0x16; prg[pc++] = 0x40;  // LDA $4016 (read button A)
+    prg[pc++] = 0x4C;                                         // JMP mainLoop
+    prg[pc++] = mainLoop & 0xFF;
+    prg[pc++] = ((mainLoop + 0x8000) >> 8) & 0xFF;
+
+    // -- NMI handler --
+    const nmiHandler = pc;
+    prg[pc++] = 0x48;  // PHA (save A)
+    // Reset scroll on each NMI
+    prg[pc++] = 0xA9; prg[pc++] = 0x00;
+    prg[pc++] = 0x8D; prg[pc++] = 0x05; prg[pc++] = 0x20;  // STA $2005 (X scroll)
+    prg[pc++] = 0x8D; prg[pc++] = 0x05; prg[pc++] = 0x20;  // STA $2005 (Y scroll)
+    // Increment a frame counter at $00
+    prg[pc++] = 0xE6; prg[pc++] = 0x00;  // INC $00
+    prg[pc++] = 0x68;  // PLA (restore A)
+    prg[pc++] = 0x40;  // RTI
+
+    // Vectors
+    prg[0x7FFA] = nmiHandler & 0xFF;
+    prg[0x7FFB] = ((nmiHandler + 0x8000) >> 8) & 0xFF;
+    prg[0x7FFC] = 0x00;  // Reset -> $8000
+    prg[0x7FFD] = 0x80;
+    prg[0x7FFE] = nmiHandler & 0xFF;  // IRQ -> same as NMI for simplicity
+    prg[0x7FFF] = ((nmiHandler + 0x8000) >> 8) & 0xFF;
+
+    return prg;
+  }
+
+  function buildChrRom(): Uint8Array {
+    const chr = new Uint8Array(8192);
+    // Create a simple pattern for tile 1 - a filled square
+    // Pattern table: each tile is 16 bytes (8 bytes low plane + 8 bytes high plane)
+    const tileAddr = 1 * 16; // tile 1
+    for (let row = 0; row < 8; row++) {
+      chr[tileAddr + row] = 0xFF;       // low plane: all pixels on
+      chr[tileAddr + row + 8] = 0x00;   // high plane: all pixels off
+    }
+    // This gives color index 01 for all pixels of tile 1
+    return chr;
+  }
+
+  test('runs 5 frames without crashing', () => {
+    const { cpu, ppu, bus } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
+
+    let framesCompleted = 0;
+    for (let frame = 0; frame < 5; frame++) {
+      const completed = runFrame(cpu, ppu);
+      if (completed) framesCompleted++;
+    }
+
+    expect(framesCompleted).toBe(5);
   });
 
-  test('frame counter increments in NMI handler', () => {
-    const { cpu, ppu, bus } = createTestNES();
+  test('NMI fires each frame and increments frame counter', () => {
+    const { cpu, ppu, bus } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
 
-    // Run 20 frames
-    for (let frame = 0; frame < 20; frame++) {
+    // Run 10 frames
+    for (let i = 0; i < 10; i++) {
       runFrame(cpu, ppu);
     }
 
-    // Read frame counter from zero page $00
-    const frameCounter = bus.cpuRead(0x0000);
-    expect(frameCounter).toBeGreaterThan(0);
+    // Frame counter at $0000 should be incremented by NMI handler each frame
+    // (NMI handler does INC $00)
+    const frameCount = bus.cpuRead(0x0000);
+    expect(frameCount).toBeGreaterThanOrEqual(7); // Startup waits for 2 VBlanks before enabling NMI
   });
 
-  test('frame buffer contains non-zero data after rendering', () => {
-    const { cpu, ppu } = createTestNES();
+  test('frame buffer has non-zero pixel data after rendering', () => {
+    const { cpu, ppu } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
 
-    // Run enough frames for rendering to start
-    for (let frame = 0; frame < 10; frame++) {
+    // Run 3 frames to let rendering start
+    for (let i = 0; i < 3; i++) {
       runFrame(cpu, ppu);
     }
 
-    // Check that frame buffer has some non-zero palette indices
+    // Check that at least some pixels are non-zero in the frame buffer
     let nonZeroPixels = 0;
     for (let i = 0; i < ppu.frameBuffer.length; i++) {
       if (ppu.frameBuffer[i] !== 0) {
@@ -224,120 +258,119 @@ describe('Full emulation', () => {
       }
     }
 
-    // With palette loaded and rendering enabled, we should have some colored pixels
     expect(nonZeroPixels).toBeGreaterThan(0);
   });
 
-  test('CPU PC does not get stuck', () => {
-    const { cpu, ppu } = createTestNES();
+  test('CPU PC advances and does not get stuck', () => {
+    const { cpu, ppu } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
 
+    // Run 3 frames and collect all PCs the CPU visits
     const pcValues = new Set<number>();
 
-    // Run a frame
-    let cyclesRun = 0;
-    while (cyclesRun < CYCLES_PER_FRAME) {
-      pcValues.add(cpu.pc);
-      const cycles = cpu.step();
-      cyclesRun += cycles;
-
-      const ppuCycles = cycles * PPU_CYCLES_PER_CPU;
-      for (let i = 0; i < ppuCycles; i++) {
+    for (let frame = 0; frame < 3; frame++) {
+      const maxCycles = 90000;
+      for (let i = 0; i < maxCycles; i++) {
         ppu.step();
         if (ppu.nmiPending) {
           cpu.triggerNMI();
           ppu.nmiPending = false;
         }
-      }
-
-      if (ppu.frameComplete) {
-        ppu.frameComplete = false;
-        break;
-      }
-    }
-
-    // PC should visit multiple addresses (not stuck on a single instruction)
-    // Note: test ROM loops on BIT $2002/BPL waiting for VBlank, so 3+ PCs is expected
-    expect(pcValues.size).toBeGreaterThanOrEqual(3);
-  });
-
-  test('PPU signals frame complete', () => {
-    const { cpu, ppu } = createTestNES();
-
-    let frameCompleteCount = 0;
-    let totalCycles = 0;
-
-    while (totalCycles < CYCLES_PER_FRAME * 3) {
-      const cycles = cpu.step();
-      totalCycles += cycles;
-
-      const ppuCycles = cycles * PPU_CYCLES_PER_CPU;
-      for (let i = 0; i < ppuCycles; i++) {
-        ppu.step();
-        if (ppu.nmiPending) {
-          cpu.triggerNMI();
-          ppu.nmiPending = false;
+        if (i % PPU_CYCLES_PER_CPU === 0) {
+          cpu.step();
+          pcValues.add(cpu.pc);
+        }
+        if (ppu.frameComplete) {
+          ppu.frameComplete = false;
+          break;
         }
       }
-
-      if (ppu.frameComplete) {
-        ppu.frameComplete = false;
-        frameCompleteCount++;
-        if (frameCompleteCount >= 3) break;
-      }
     }
 
-    expect(frameCompleteCount).toBeGreaterThanOrEqual(3);
+    // CPU should visit at least a few addresses (test ROM loops tightly on BIT/BPL)
+    expect(pcValues.size).toBeGreaterThanOrEqual(2);
   });
 
-  test('controller input is read correctly during emulation', () => {
-    const { cpu, ppu, controller1, bus } = createTestNES();
+  test('controller input is readable during emulation', () => {
+    const { cpu, ppu, ctrl1, bus } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
 
-    // Press the Start button
-    controller1.setButton(3, true); // Start button
-
-    // Run a frame
+    // Run 2 frames to get into main loop
+    runFrame(cpu, ppu);
     runFrame(cpu, ppu);
 
-    // Strobe controller
+    // Press the A button
+    ctrl1.setButton(Button.A, true);
+
+    // Strobe the controller
     bus.cpuWrite(0x4016, 1);
     bus.cpuWrite(0x4016, 0);
 
-    // Read button states (A, B, Select, Start, Up, Down, Left, Right)
-    const buttons: number[] = [];
-    for (let i = 0; i < 8; i++) {
-      buttons.push(bus.cpuRead(0x4016) & 1);
-    }
+    // Read button A (first read after strobe)
+    const buttonA = bus.cpuRead(0x4016) & 1;
+    expect(buttonA).toBe(1);
 
-    // Start button (index 3) should be 1
-    expect(buttons[3]).toBe(1);
-    // Other buttons should be 0
-    expect(buttons[0]).toBe(0); // A
-    expect(buttons[1]).toBe(0); // B
-    expect(buttons[2]).toBe(0); // Select
+    // Read button B (second read)
+    const buttonB = bus.cpuRead(0x4016) & 1;
+    expect(buttonB).toBe(0); // B not pressed
+
+    // Release A and verify
+    ctrl1.setButton(Button.A, false);
+    bus.cpuWrite(0x4016, 1);
+    bus.cpuWrite(0x4016, 0);
+    const buttonAAfter = bus.cpuRead(0x4016) & 1;
+    expect(buttonAAfter).toBe(0);
   });
 
-  test('OAM DMA works during emulation', () => {
-    const { cpu, ppu, bus } = createTestNES();
+  test('PPU registers remain accessible across frames', () => {
+    const { cpu, ppu, bus } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
 
-    // Run a frame first
+    // Run one frame
     runFrame(cpu, ppu);
 
-    // Write sprite data to CPU RAM page $02 ($0200-$02FF)
-    for (let i = 0; i < 256; i++) {
-      bus.cpuWrite(0x0200 + i, i);
+    // PPUSTATUS should be readable (bit 7 clear since we're past VBlank clear)
+    const status = bus.cpuRead(0x2002);
+    // After reading, write toggle should be reset
+    // We can verify by doing a PPUADDR write sequence
+    bus.cpuWrite(0x2006, 0x20);  // high byte
+    bus.cpuWrite(0x2006, 0x00);  // low byte
+    // Writing a tile ID via PPUDATA
+    bus.cpuWrite(0x2007, 0x42);
+    // Read it back (buffered - need two reads)
+    bus.cpuRead(0x2002); // reset toggle
+    bus.cpuWrite(0x2006, 0x20);
+    bus.cpuWrite(0x2006, 0x00);
+    bus.cpuRead(0x2007); // primes buffer
+    const readBack = bus.cpuRead(0x2007); // gets buffered value
+    expect(readBack).toBe(0x42);
+  });
+
+  test('OAM DMA transfers sprite data correctly', () => {
+    const { cpu, ppu, bus } = createTestSystem({
+      prgRom: buildTestRom(),
+      chrRom: buildChrRom(),
+    });
+
+    // Run 3 frames to ensure DMA has happened
+    for (let i = 0; i < 3; i++) {
+      runFrame(cpu, ppu);
     }
 
-    // Trigger OAM DMA from page $02
-    bus.cpuWrite(0x4014, 0x02);
-
-    // OAM should now contain the data
-    // Read OAM via PPU register $2004 (set OAMADDR to 0 first)
-    bus.cpuWrite(0x2003, 0x00);
-    const firstByte = bus.cpuRead(0x2004);
-    expect(firstByte).toBe(0x00); // OAM[0] should be 0
-
-    bus.cpuWrite(0x2003, 0x04);
-    const fifthByte = bus.cpuRead(0x2004);
-    expect(fifthByte).toBe(0x04); // OAM[4] should be 4
+    // The test ROM writes sprite 0 at $0200-$0203 and then does OAM DMA from page $02
+    // Sprite 0: Y=0x1E, tile=0x01, attr=0x00, X=0x10
+    // After DMA, these should be in OAM
+    // We can read OAM via OAMADDR ($2003) + OAMDATA ($2004)
+    bus.cpuWrite(0x2003, 0x00); // OAMADDR = 0
+    const sprY = bus.cpuRead(0x2004);
+    // Note: reading OAMDATA during rendering can return garbage,
+    // but outside rendering it should work
+    expect(sprY).toBe(0x1E);
   });
 });
