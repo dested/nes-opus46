@@ -5,6 +5,7 @@ export interface PPUMapper {
   ppuRead(addr: number): number;
   ppuWrite(addr: number, value: number): void;
   getMirrorMode(): MirrorMode;
+  scanlineTick?(): void;
 }
 
 export class PPU {
@@ -67,6 +68,9 @@ export class PPU {
 
   // Mapper for CHR reads
   private mapper: PPUMapper | null = null;
+
+  // A12 tracking for MMC3 scanline counter
+  private lastA12: number = 0;
 
   // Mirror lookup tables (pre-computed)
   private static readonly MIRROR_LOOKUP: Record<number, number[]> = {
@@ -259,6 +263,11 @@ export class PPU {
   private ppuReadInternal(address: number): number {
     const addr = address & 0x3FFF;
     if (addr < 0x2000) {
+      const a12 = (addr >> 12) & 1;
+      if (a12 && !this.lastA12) {
+        this.mapper!.scanlineTick?.();
+      }
+      this.lastA12 = a12;
       return this.mapper!.ppuRead(addr);
     } else if (addr < 0x3F00) {
       return this.vram[this.mirrorAddress(addr)];

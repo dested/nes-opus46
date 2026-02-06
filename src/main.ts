@@ -122,6 +122,13 @@ async function main() {
         }
       }
 
+      // Poll mapper IRQ
+      if (mapper.irqPending?.()) {
+        cpu.triggerIRQ();
+      } else {
+        cpu.clearIRQ();
+      }
+
       // Check if frame is complete
       if (ppu.frameComplete) {
         ppu.frameComplete = false;
