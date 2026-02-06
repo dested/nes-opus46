@@ -1,6 +1,7 @@
 import { MirrorMode } from '../types';
 import { RomInfo } from '../rom';
 import { createMapper0 } from './mapper0';
+import { createMapper1 } from './mapper1';
 import { createMapper4 } from './mapper4';
 
 export interface Mapper {
@@ -17,6 +18,8 @@ export function createMapper(romInfo: RomInfo): Mapper {
   switch (romInfo.mapper) {
     case 0:
       return createMapper0(romInfo);
+    case 1:
+      return createMapper1(romInfo);
     case 4:
       return createMapper4(romInfo);
     default:
